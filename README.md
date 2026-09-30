@@ -28,7 +28,7 @@ import responsible_request as rr
 client = rr.AsyncOpenAI(                       # same arguments as openai.AsyncOpenAI
     base_url="https://inference.example.org/api/v1",
     api_key="sk-...",
-    throttle=rr.ThrottleConfig(max_rpm=300, min_rpm=5),
+    throttle=rr.ThrottleConfig(max_rpm=15, min_rpm=1),
     log=rr.LogConfig(sqlite="requests.db"),
     default_params=rr.reproducible(seed=42),   # temperature=0, top_p=1, seed=42 unless set per call
 )
@@ -45,7 +45,7 @@ For existing code, only the HTTP client has to change:
 ```python
 import openai, responsible_request as rr
 
-client = openai.AsyncOpenAI(http_client=rr.http_client(rr.ThrottleConfig(max_rpm=300)))
+client = openai.AsyncOpenAI(http_client=rr.http_client(rr.ThrottleConfig(max_rpm=15)))
 ```
 
 It also works as a plain fixed-rate limiter for everyday use: `rr.ThrottleConfig.fixed(60)`.
@@ -106,9 +106,9 @@ start_rpm                  ramp ×1.5 / 30 s        ramp ×1.5 / 30 s   cooldown
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `max_rpm` | 300 | rate when the endpoint is idle |
-| `min_rpm` | 5 | rate while others are active (also the probing rate) |
-| `start_rpm` | 30 | rate while the baseline is being established |
+| `max_rpm` | 15 | rate when the endpoint is idle |
+| `min_rpm` | 1 | rate while others are active (also the probing rate) |
+| `start_rpm` | 2 | rate while the baseline is being established |
 | `max_concurrency` | 32 | max requests in flight per model |
 | `high_ratio` | 3.0 | throttle when latency ≥ this × baseline |
 | `recover_ratio` | 1.5 | ramp up only when latency < this × baseline |
@@ -149,7 +149,7 @@ df = rr.load_records("requests.db")   # pandas DataFrame if pandas is installed,
 
 - **Your own load raises latency too.** If `max_rpm` is high enough to saturate the server by itself, the client will throttle itself. The low-percentile baseline and the dead band absorb moderate self-load. Choose `max_rpm`/`max_concurrency` so that you alone don't saturate the backend.
 - **One process, one event loop per client.** Throttle state is not shared between processes. Several scripts running in parallel each throttle independently.
-- **Detection latency.** At `min_rpm=5` and `window=10`, noticing that others have left takes about two minutes plus the cooldown. This is deliberate: the client stays polite longer than strictly needed.
+- **Detection latency.** At `min_rpm=1` and `window=10`, noticing that others have left takes about ten minutes plus the cooldown. This is deliberate: the client stays polite longer than strictly needed.
 - If the backend becomes permanently slower (e.g. a model is redeployed on smaller hardware), call `client.throttle.reset_baseline()`.
 
 ## Development

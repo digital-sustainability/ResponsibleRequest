@@ -24,11 +24,11 @@ class ThrottleConfig:
     429/5xx/timeouts).
     """
 
-    max_rpm: float = 300
+    max_rpm: float = 15
     """Upper bound on requests per minute when the endpoint is idle."""
-    min_rpm: float = 5
+    min_rpm: float = 1
     """Requests per minute while other users are active. Also serves as probing rate."""
-    start_rpm: float = 30
+    start_rpm: float = 2
     """Initial rate while the latency baseline is being established (clamped to [min, max])."""
     max_concurrency: int = 32
     """Maximum number of in-flight requests per model, regardless of RPM."""
