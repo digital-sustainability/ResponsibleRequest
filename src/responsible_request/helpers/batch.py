@@ -12,6 +12,7 @@ import openai
 
 from ..client import get_throttle
 from ..config import ThrottleConfig
+from ..cost import BudgetExceeded
 from ..estimator import LatencyEstimator, metric_value
 from ..records import tags
 
@@ -31,6 +32,8 @@ async def run_batch(
 
     The throttle paces the requests, so all of them can be submitted at once. Each request
     record is tagged with ``batch_id`` and ``item_index`` for joining logs with results.
+    Once a cost budget is exhausted, the remaining requests fail fast with
+    :class:`responsible_request.BudgetExceeded`.
 
     :param requests: Keyword arguments for ``call``, one dict per request.
     :param call: Coroutine function to call, defaults to ``client.chat.completions.create``.
@@ -47,6 +50,11 @@ async def run_batch(
         try:
             with tags(batch_id=batch_id, item_index=index):
                 return await call(**kwargs)
+        except openai.APIConnectionError as exc:
+            # older SDKs wrap exceptions raised by the transport
+            if isinstance(exc.__cause__, BudgetExceeded):
+                raise exc.__cause__ from None
+            raise
         finally:
             if bar is not None:
                 bar.update(1)

@@ -1,6 +1,12 @@
 # responsible-request
 
-Load-aware rate limiting and request logging for OpenAI-compatible LLM gateways (LiteLLM, vLLM, Ollama, …).
+Responsible LLM requests for research, against any OpenAI-compatible endpoint (LiteLLM, OpenRouter, vLLM, Ollama, OpenAI, …). It works as a drop-in for `openai.AsyncOpenAI`.
+
+- **Polite**: load-aware throttling, so large experiments don't starve the other users of a shared inference server.
+- **Reproducible**: every request is logged (parameters, messages, responses, tokens, timing, provider, system fingerprint) to JSONL and/or SQLite, each client writes a run manifest (versions, git commit, configuration), and `rr.reproducible()` pins the decoding parameters.
+- **Cost-safe**: a response cache means a restarted script only sends what is still missing, and per-request cost tracking with an optional budget stops spending before it gets out of hand, even across restarts.
+
+## Load-aware throttling in a nutshell
 
 Large experiments can starve the other users of a shared inference server. Hard RPM limits are the usual answer, but they leave the server idle at night and still hurt others at peak times. `responsible-request` instead **watches the latency of your own requests**:
 
@@ -8,7 +14,7 @@ Large experiments can starve the other users of a shared inference server. Hard 
 - As soon as latency reaches 3× the baseline (or the server returns 429/5xx/timeouts), other users are active, so the client drops to `min_rpm` at once.
 - Once latency is back to normal, the client ramps up again.
 
-It works as a drop-in for `openai.AsyncOpenAI` and logs every request (tokens, timing, throttle state, and optionally full messages) to JSONL and/or SQLite.
+For commercial APIs with generous rate limits of their own (OpenAI, OpenRouter, …), load-aware throttling is not needed: use a plain fixed-rate limiter, `rr.ThrottleConfig.fixed(rpm)`. The adaptive throttle treats a 429 as a sign of other users and drops to `min_rpm` for at least `cooldown_s`.
 
 ## Installation
 
@@ -49,6 +55,23 @@ client = openai.AsyncOpenAI(http_client=rr.http_client(rr.ThrottleConfig(max_rpm
 ```
 
 It also works as a plain fixed-rate limiter for everyday use: `rr.ThrottleConfig.fixed(60)`.
+
+With OpenRouter (or any other commercial endpoint), a typical setup is:
+
+```python
+client = rr.AsyncOpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.environ["OPENROUTER_API_KEY"],
+    throttle=rr.ThrottleConfig.fixed(120),
+    log=rr.LogConfig(sqlite="requests.db"),
+    cache=True,                                 # a re-run only sends what is missing
+    cost=rr.CostConfig(budget_usd=5),           # stop at $5, counting earlier runs in requests.db
+    run=rr.RunConfig(name="ablation-3"),
+    default_params=rr.reproducible(seed=42),
+)
+```
+
+See `examples/openrouter.py`.
 
 ## Helpers
 
@@ -131,11 +154,11 @@ The package logs through [loguru](https://github.com/Delgan/loguru) and, as logu
 
 | Group | Fields |
 |---|---|
-| core (always) | `request_id`, `timestamp`, `method`, `path`, `model`, `stream`, `attempt`, `status_code`, `error`, `tags`, `cache_key`, `cache_hit` |
+| core (always) | `request_id`, `timestamp`, `method`, `path`, `model`, `stream`, `attempt`, `status_code`, `error`, `tags`, `cache_key`, `cache_hit`, `run_id` |
 | `timing` | `sent_at`, `first_byte_at`, `finished_at`, `wait_s` (time spent throttled), `ttfb_s`, `latency_s` |
-| `usage` | `prompt_tokens`, `completion_tokens`, `total_tokens`, `cached_tokens`, `reasoning_tokens` |
+| `usage` | `prompt_tokens`, `completion_tokens`, `total_tokens`, `cached_tokens`, `reasoning_tokens`, `cost_usd` |
 | `throttle` | `rpm`, `state`, `baseline`, `load_ratio`, `in_flight` |
-| `response_meta` | `response_id`, `response_model`, `finish_reason`, LiteLLM call/model id and duration headers |
+| `response_meta` | `response_id`, `response_model`, `finish_reason`, `system_fingerprint`, `provider`, `gateway_request_id`, `upstream_duration_ms`, `provider_meta` (see below) |
 | `params` | all request parameters except messages/input |
 | `request_body` / `response_body` | full request and response (for streams: the concatenated content) |
 
@@ -143,6 +166,40 @@ All groups are logged by default. Turn groups off with `LogConfig(fields={"reque
 
 ```python
 df = rr.load_records("requests.db")   # pandas DataFrame if pandas is installed, else list of dicts
+```
+
+### Provider metadata
+
+Gateways and routers report different extra information. *Extractors* map it to the generic `response_meta` fields and put everything else into the `provider_meta` JSON column. All built-in extractors run on every response and only fill in what they find, so nothing has to be configured:
+
+| Extractor | Reads |
+|---|---|
+| `openai_compat` | `x-request-id` / `request-id` → `gateway_request_id`, `openai-processing-ms` → `upstream_duration_ms` |
+| `litellm` | `x-litellm-call-id` → `gateway_request_id`, `x-litellm-response-duration-ms` → `upstream_duration_ms`, `x-litellm-response-cost` → `cost_usd`, all other `x-litellm-*` headers → `provider_meta["litellm"]` |
+| `openrouter` | `provider` → `provider`, `usage.cost` → `cost_usd`, `usage.is_byok`/`cost_details` and `native_finish_reason` → `provider_meta["openrouter"]` |
+
+Add your own for other endpoints:
+
+```python
+def my_gateway(record, headers, body):       # body: parsed JSON, stream summary, or None
+    if "x-queue-ms" in headers:
+        rr.providers.meta(record, "my_gateway")["queue_ms"] = float(headers["x-queue-ms"])
+
+client = rr.AsyncOpenAI(..., extractors=[my_gateway])
+```
+
+Databases written by version 0.1 keep their `litellm_*` columns; new records leave them empty.
+
+### Runs
+
+Every client is a *run* with its own `run_id`, which every record carries. With a JSONL or SQLite log, the first request also writes a run manifest: the run name and `metadata`, start time, endpoint (scheme and host only, never the API key), versions of `responsible-request`, `openai` and Python, platform, hostname, command line, working directory, git commit and dirty flag, and the complete throttle, log, cache and cost configuration plus `default_params`.
+
+```python
+client = rr.AsyncOpenAI(..., run=rr.RunConfig(name="ablation-3", metadata={"dataset": "v2"}))
+# or simply run="ablation-3"
+
+runs = rr.load_runs("requests.db")            # the `runs` table, or requests.runs.jsonl for a JSONL log
+df = rr.load_records("requests.db").merge(runs, on="run_id", suffixes=("", "_run"))
 ```
 
 ## Caching
@@ -170,6 +227,26 @@ for i in range(5):
 ```
 
 Other tags (e.g. `experiment=...`) are not part of the key. Records are written asynchronously, so an identical request sent a few milliseconds after the first one may still go to the server.
+
+## Cost and budget
+
+With `cost=True` or a `rr.CostConfig`, every record gets a `cost_usd`:
+
+1. the cost the provider reports (OpenRouter `usage.cost`, LiteLLM `x-litellm-response-cost`, or a custom extractor), else
+2. the cost computed from token usage and `CostConfig(prices={"model": rr.Price(input=..., output=..., cached_input=...)})` (USD per million tokens; there is no built-in price list, since it would go stale), else
+3. `None`.
+
+Cache hits cost `0.0`. `client.cost.stats()` shows what was spent, and the per-model summary line and `client.throttle.stats()` include it.
+
+```python
+client = rr.AsyncOpenAI(..., log=rr.LogConfig(sqlite="requests.db"), cost=rr.CostConfig(budget_usd=5))
+```
+
+- Once `budget_usd` has been spent, new requests raise `rr.BudgetExceeded` instead of being sent (`run_batch` returns it for each remaining item). Cache hits are still served, so re-running a finished experiment works with an exhausted budget.
+- With `include_logged=True` (the default), the spend already recorded in the log counts too, so restarting a script after a crash does not reset the budget. This sums **all** records in the log file, so use one database per experiment or budget.
+- Requests already in flight when the budget runs out still complete, so the budget can be exceeded by their cost.
+- If a budget is set but a model's responses carry no cost and no price is configured, a warning is logged once: the budget cannot see those requests.
+- With `openai<2`, the SDK retries requests after an exception, so a blocked request is attempted `max_retries` more times (each blocked again, without a network call) before `rr.BudgetExceeded` is raised.
 
 ## Caveats
 

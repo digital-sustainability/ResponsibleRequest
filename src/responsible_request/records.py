@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import json
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -45,22 +44,25 @@ GROUP_FIELDS: dict[str, tuple[str, ...]] = {
         "total_tokens",
         "cached_tokens",
         "reasoning_tokens",
+        "cost_usd",
     ),
     "throttle": ("rpm", "state", "baseline", "load_ratio", "in_flight"),
     "response_meta": (
         "response_id",
         "response_model",
         "finish_reason",
-        "litellm_call_id",
-        "litellm_model_id",
-        "litellm_response_duration_ms",
+        "system_fingerprint",
+        "provider",
+        "gateway_request_id",
+        "upstream_duration_ms",
+        "provider_meta",
     ),
     "params": ("params",),
     "request_body": ("request_body",),
     "response_body": ("response_body",),
 }
 
-JSON_FIELDS = ("params", "request_body", "response_body", "tags")
+JSON_FIELDS = ("params", "request_body", "response_body", "tags", "provider_meta")
 
 
 def utc_iso(ts: float | None) -> str | None:
@@ -85,6 +87,7 @@ class RequestRecord:
     tags: dict[str, Any] = field(default_factory=dict)
     cache_key: str | None = None  # hash of URL, JSON body and key tags (see CacheConfig)
     cache_hit: bool = False  # served from the cache, not sent to the server
+    run_id: str | None = None  # links the record to its run manifest (see RunConfig)
 
     # timing
     sent_at: str | None = None
@@ -100,6 +103,7 @@ class RequestRecord:
     total_tokens: int | None = None
     cached_tokens: int | None = None
     reasoning_tokens: int | None = None
+    cost_usd: float | None = None  # reported by the provider or computed from CostConfig.prices
 
     # throttle (state after this observation was processed)
     rpm: float | None = None  # rate at which this request was sent
@@ -112,9 +116,11 @@ class RequestRecord:
     response_id: str | None = None
     response_model: str | None = None
     finish_reason: str | None = None
-    litellm_call_id: str | None = None
-    litellm_model_id: str | None = None
-    litellm_response_duration_ms: float | None = None
+    system_fingerprint: str | None = None
+    provider: str | None = None  # upstream provider that served the request (e.g. via OpenRouter)
+    gateway_request_id: str | None = None  # request/call id assigned by the gateway or API
+    upstream_duration_ms: float | None = None  # processing time reported by the gateway
+    provider_meta: dict[str, Any] | None = None  # anything else extractors found
 
     params: dict[str, Any] | None = None
     request_body: Any = None
@@ -203,6 +209,8 @@ def apply_json_response(record: RequestRecord, body: Any) -> None:
     choices = body.get("choices")
     if isinstance(choices, list) and choices and isinstance(choices[0], dict):
         record.finish_reason = choices[0].get("finish_reason")
+    if isinstance(body.get("system_fingerprint"), str):
+        record.system_fingerprint = body["system_fingerprint"]
     apply_usage(record, body.get("usage"))
 
 
@@ -226,7 +234,7 @@ def parse_sse(text: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     content: list[str] = []
     reasoning: list[str] = []
     for event in events:
-        for key in ("id", "model"):
+        for key in ("id", "model", "provider", "system_fingerprint"):
             if isinstance(event.get(key), str):
                 summary[key] = event[key]
         if event.get("usage"):
@@ -253,13 +261,5 @@ def apply_sse_response(record: RequestRecord, summary: dict[str, Any]) -> None:
     record.response_id = summary.get("id")
     record.response_model = summary.get("model")
     record.finish_reason = summary.get("finish_reason")
+    record.system_fingerprint = summary.get("system_fingerprint")
     apply_usage(record, summary.get("usage"))
-
-
-def apply_litellm_headers(record: RequestRecord, headers: Any) -> None:
-    record.litellm_call_id = headers.get("x-litellm-call-id")
-    record.litellm_model_id = headers.get("x-litellm-model-id")
-    duration = headers.get("x-litellm-response-duration-ms")
-    if duration is not None:
-        with contextlib.suppress(ValueError):
-            record.litellm_response_duration_ms = float(duration)

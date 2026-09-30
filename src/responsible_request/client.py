@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 import openai
 from loguru import logger
 
 from .cache import ResponseCache
-from .config import CacheConfig, LogConfig, ThrottleConfig
+from .config import CacheConfig, CostConfig, LogConfig, RunConfig, ThrottleConfig
+from .cost import BudgetExceeded, CostTracker
 from .logging import setup_logging
+from .providers import DEFAULT_EXTRACTORS, Extractor
+from .runs import Run
 from .throttle import Throttle
 from .transport import ThrottledTransport
 
@@ -22,6 +25,9 @@ def http_client(
     default_params: Mapping[str, Any] | None = None,
     inject_stream_usage: bool = True,
     cache: CacheConfig | bool | None = None,
+    cost: CostConfig | bool | None = None,
+    run: RunConfig | str | None = None,
+    extractors: Iterable[Extractor] = (),
     transport: Any = None,
     **client_kwargs: Any,
 ) -> Any:
@@ -39,6 +45,12 @@ def http_client(
     :param inject_stream_usage: Request token usage for streamed chat completions.
     :param cache: ``True`` or a :class:`CacheConfig` to answer requests that were already
         answered successfully from the logged records instead of sending them again.
+    :param cost: ``True`` or a :class:`CostConfig` to track the cost of every request and
+        optionally enforce a budget.
+    :param run: A :class:`RunConfig` (or just a run name) for the run manifest written on the
+        first request. Every record carries the ``run_id``.
+    :param extractors: Additional response metadata extractors (see
+        :mod:`responsible_request.providers`), run after the built-in ones.
     :param transport: Underlying transport (defaults to a plain async HTTP transport).
     :param client_kwargs: Passed to ``openai.DefaultAsyncHttpxClient`` (e.g. ``timeout``).
     """
@@ -46,6 +58,17 @@ def http_client(
     log_config = LogConfig() if log is True else (log or None)
     cache_config = CacheConfig() if cache is True else (cache or None)
     response_cache = ResponseCache(cache_config, log_config) if cache_config is not None else None
+    cost_config = CostConfig() if cost is True else (cost or None)
+    tracker = CostTracker(cost_config, log_config) if cost_config is not None else None
+    run_config = RunConfig(name=run) if isinstance(run, str) else run
+    rr_run = Run(
+        run_config,
+        throttle=state.config,
+        log=log_config,
+        cache=cache_config,
+        cost=cost_config,
+        default_params=default_params,
+    )
     if log_config is not None:
         setup_logging(log_config)
     rr_transport = ThrottledTransport(
@@ -54,11 +77,16 @@ def http_client(
         default_params=default_params,
         inject_stream_usage=inject_stream_usage,
         cache=response_cache,
+        cost=tracker,
+        run=rr_run,
+        extractors=(*DEFAULT_EXTRACTORS, *extractors),
         transport=transport,
     )
     client = openai.DefaultAsyncHttpxClient(transport=rr_transport, **client_kwargs)
     client.rr_throttle = state  # type: ignore[attr-defined]
     client.rr_cache = response_cache  # type: ignore[attr-defined]
+    client.rr_cost = tracker  # type: ignore[attr-defined]
+    client.rr_run_id = rr_run.run_id  # type: ignore[attr-defined]
     return client
 
 
@@ -78,13 +106,17 @@ class AsyncOpenAI(openai.AsyncOpenAI):
     """``openai.AsyncOpenAI`` with load-aware throttling and request logging.
 
     Accepts every argument of ``openai.AsyncOpenAI`` plus ``throttle``, ``log``,
-    ``default_params`` and ``cache`` (see :func:`http_client`). The throttle state is available
-    as ``client.throttle``; ``client.throttle.stats()`` shows the current rate and load per model.
-    ``client.cache.stats()`` counts cache hits and misses (``client.cache`` is None without cache).
+    ``default_params``, ``cache``, ``cost``, ``run`` and ``extractors`` (see :func:`http_client`).
+    The throttle state is available as ``client.throttle``; ``client.throttle.stats()`` shows the
+    current rate and load per model. ``client.cache.stats()`` counts cache hits and misses and
+    ``client.cost.stats()`` shows the spent cost (both are None unless enabled).
+    ``client.run_id`` identifies this client's records and run manifest.
     """
 
     throttle: Throttle
     cache: ResponseCache | None
+    cost: CostTracker | None
+    run_id: str
 
     def __init__(
         self,
@@ -93,11 +125,22 @@ class AsyncOpenAI(openai.AsyncOpenAI):
         log: LogConfig | bool | None = True,
         default_params: Mapping[str, Any] | None = None,
         cache: CacheConfig | bool | None = None,
+        cost: CostConfig | bool | None = None,
+        run: RunConfig | str | None = None,
+        extractors: Iterable[Extractor] = (),
         http_client: Any = None,
         **kwargs: Any,
     ) -> None:
         if http_client is None:
-            http_client = _http_client(throttle, log, default_params=default_params, cache=cache)
+            http_client = _http_client(
+                throttle,
+                log,
+                default_params=default_params,
+                cache=cache,
+                cost=cost,
+                run=run,
+                extractors=extractors,
+            )
         elif getattr(http_client, "rr_throttle", None) is None:
             raise TypeError(
                 "pass throttle/log options instead of http_client, or build the http client "
@@ -106,6 +149,17 @@ class AsyncOpenAI(openai.AsyncOpenAI):
         super().__init__(http_client=http_client, **kwargs)
         self.throttle = http_client.rr_throttle
         self.cache = http_client.rr_cache
+        self.cost = http_client.rr_cost
+        self.run_id = http_client.rr_run_id
+
+    async def request(self, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return await super().request(*args, **kwargs)
+        except openai.APIConnectionError as exc:
+            # older SDKs wrap exceptions raised by the transport
+            if isinstance(exc.__cause__, BudgetExceeded):
+                raise exc.__cause__ from None
+            raise
 
     async def close(self) -> None:
         await super().close()

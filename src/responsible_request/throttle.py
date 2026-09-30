@@ -22,6 +22,7 @@ class LaneStats:
     errors: int = 0
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    cost_usd: float = 0.0
 
     def add(self, record: RequestRecord) -> None:
         self.requests += 1
@@ -29,12 +30,13 @@ class LaneStats:
             self.errors += 1
         self.prompt_tokens += record.prompt_tokens or 0
         self.completion_tokens += record.completion_tokens or 0
+        self.cost_usd += record.cost_usd or 0.0
 
 
 class Lane:
     """Throttling state for one (endpoint, model) pair.
 
-    The gateway routes every model to its own backend, so load is tracked separately per model.
+    Endpoints usually serve every model from its own backend, so load is tracked per model.
     Lanes for endpoints that are not in ``observe_paths`` are paced and react to server errors,
     but they do not adapt to latency.
     """
@@ -98,6 +100,7 @@ class Lane:
             "errors": self.totals.errors,
             "prompt_tokens": self.totals.prompt_tokens,
             "completion_tokens": self.totals.completion_tokens,
+            "cost_usd": round(self.totals.cost_usd, 6),
         }
 
 

@@ -15,13 +15,6 @@ from .conftest import chat_response, json_response, make_client
 MSG = [{"role": "user", "content": "hi"}]
 
 
-@pytest.fixture
-def cleanup_sinks():
-    yield
-    rr.remove_sinks()
-    logger.disable("responsible_request")
-
-
 class Server:
     """Answers with a new content per call, so cached and fresh answers can be told apart."""
 

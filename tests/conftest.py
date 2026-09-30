@@ -59,9 +59,9 @@ def make_client(handler: Handler, **kwargs: Any) -> rr.AsyncOpenAI:
     throttle = kwargs.pop("throttle", rr.ThrottleConfig(max_rpm=6000, start_rpm=6000))
     log = kwargs.pop("log", False)
     default_params = kwargs.pop("default_params", None)
-    cache = kwargs.pop("cache", None)
+    rr_options = {k: kwargs.pop(k) for k in ("cache", "cost", "run", "extractors") if k in kwargs}
     http = rr.http_client(
-        throttle, log, default_params=default_params, cache=cache, transport=transport
+        throttle, log, default_params=default_params, transport=transport, **rr_options
     )
     return rr.AsyncOpenAI(api_key="test", base_url="http://test/api/v1", http_client=http, **kwargs)
 
@@ -82,6 +82,13 @@ def records() -> Any:
     )
     yield collected
     logger.remove(handler_id)
+    logger.disable("responsible_request")
+
+
+@pytest.fixture
+def cleanup_sinks() -> Any:
+    yield
+    rr.remove_sinks()
     logger.disable("responsible_request")
 
 
