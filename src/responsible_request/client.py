@@ -8,7 +8,8 @@ from typing import Any
 import openai
 from loguru import logger
 
-from .config import LogConfig, ThrottleConfig
+from .cache import ResponseCache
+from .config import CacheConfig, LogConfig, ThrottleConfig
 from .logging import setup_logging
 from .throttle import Throttle
 from .transport import ThrottledTransport
@@ -20,6 +21,7 @@ def http_client(
     *,
     default_params: Mapping[str, Any] | None = None,
     inject_stream_usage: bool = True,
+    cache: CacheConfig | bool | None = None,
     transport: Any = None,
     **client_kwargs: Any,
 ) -> Any:
@@ -35,11 +37,15 @@ def http_client(
     :param default_params: Chat completion parameters added to every request that does not set
         them itself, e.g. ``rr.reproducible()``.
     :param inject_stream_usage: Request token usage for streamed chat completions.
+    :param cache: ``True`` or a :class:`CacheConfig` to answer requests that were already
+        answered successfully from the logged records instead of sending them again.
     :param transport: Underlying transport (defaults to a plain async HTTP transport).
     :param client_kwargs: Passed to ``openai.DefaultAsyncHttpxClient`` (e.g. ``timeout``).
     """
     state = throttle if isinstance(throttle, Throttle) else Throttle(throttle)
     log_config = LogConfig() if log is True else (log or None)
+    cache_config = CacheConfig() if cache is True else (cache or None)
+    response_cache = ResponseCache(cache_config, log_config) if cache_config is not None else None
     if log_config is not None:
         setup_logging(log_config)
     rr_transport = ThrottledTransport(
@@ -47,10 +53,12 @@ def http_client(
         log=log_config,
         default_params=default_params,
         inject_stream_usage=inject_stream_usage,
+        cache=response_cache,
         transport=transport,
     )
     client = openai.DefaultAsyncHttpxClient(transport=rr_transport, **client_kwargs)
     client.rr_throttle = state  # type: ignore[attr-defined]
+    client.rr_cache = response_cache  # type: ignore[attr-defined]
     return client
 
 
@@ -69,12 +77,14 @@ def get_throttle(client: Any) -> Throttle:
 class AsyncOpenAI(openai.AsyncOpenAI):
     """``openai.AsyncOpenAI`` with load-aware throttling and request logging.
 
-    Accepts every argument of ``openai.AsyncOpenAI`` plus ``throttle``, ``log`` and
-    ``default_params`` (see :func:`http_client`). The throttle state is available as
-    ``client.throttle``; ``client.throttle.stats()`` shows the current rate and load per model.
+    Accepts every argument of ``openai.AsyncOpenAI`` plus ``throttle``, ``log``,
+    ``default_params`` and ``cache`` (see :func:`http_client`). The throttle state is available
+    as ``client.throttle``; ``client.throttle.stats()`` shows the current rate and load per model.
+    ``client.cache.stats()`` counts cache hits and misses (``client.cache`` is None without cache).
     """
 
     throttle: Throttle
+    cache: ResponseCache | None
 
     def __init__(
         self,
@@ -82,11 +92,12 @@ class AsyncOpenAI(openai.AsyncOpenAI):
         throttle: ThrottleConfig | Throttle | None = None,
         log: LogConfig | bool | None = True,
         default_params: Mapping[str, Any] | None = None,
+        cache: CacheConfig | bool | None = None,
         http_client: Any = None,
         **kwargs: Any,
     ) -> None:
         if http_client is None:
-            http_client = _http_client(throttle, log, default_params=default_params)
+            http_client = _http_client(throttle, log, default_params=default_params, cache=cache)
         elif getattr(http_client, "rr_throttle", None) is None:
             raise TypeError(
                 "pass throttle/log options instead of http_client, or build the http client "
@@ -94,6 +105,7 @@ class AsyncOpenAI(openai.AsyncOpenAI):
             )
         super().__init__(http_client=http_client, **kwargs)
         self.throttle = http_client.rr_throttle
+        self.cache = http_client.rr_cache
 
     async def close(self) -> None:
         await super().close()

@@ -55,6 +55,7 @@ class SQLiteSink:
             for col in self._columns:
                 if col not in existing:  # schema grew in a newer version
                     conn.execute(f'ALTER TABLE requests ADD COLUMN "{col}"')
+            conn.execute("CREATE INDEX IF NOT EXISTS requests_cache_key ON requests(cache_key)")
             conn.commit()
             self._conn = conn
         return self._conn

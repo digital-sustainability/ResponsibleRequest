@@ -13,8 +13,9 @@ from importlib.metadata import PackageNotFoundError, version
 from loguru import logger
 
 from .analysis import load_records
+from .cache import ResponseCache
 from .client import AsyncOpenAI, get_throttle, http_client
-from .config import FIELD_GROUPS, LogConfig, ThrottleConfig
+from .config import FIELD_GROUPS, CacheConfig, LogConfig, ThrottleConfig
 from .controller import State, ThrottleController
 from .estimator import LatencyEstimator, LoadEstimator
 from .helpers import (
@@ -43,10 +44,12 @@ logger.disable(__name__)
 __all__ = [
     "FIELD_GROUPS",
     "AsyncOpenAI",
+    "CacheConfig",
     "LatencyEstimator",
     "LoadEstimator",
     "LogConfig",
     "RequestRecord",
+    "ResponseCache",
     "State",
     "StructuredOutputError",
     "Throttle",

@@ -131,7 +131,7 @@ The package logs through [loguru](https://github.com/Delgan/loguru) and, as logu
 
 | Group | Fields |
 |---|---|
-| core (always) | `request_id`, `timestamp`, `method`, `path`, `model`, `stream`, `attempt`, `status_code`, `error`, `tags` |
+| core (always) | `request_id`, `timestamp`, `method`, `path`, `model`, `stream`, `attempt`, `status_code`, `error`, `tags`, `cache_key`, `cache_hit` |
 | `timing` | `sent_at`, `first_byte_at`, `finished_at`, `wait_s` (time spent throttled), `ttfb_s`, `latency_s` |
 | `usage` | `prompt_tokens`, `completion_tokens`, `total_tokens`, `cached_tokens`, `reasoning_tokens` |
 | `throttle` | `rpm`, `state`, `baseline`, `load_ratio`, `in_flight` |
@@ -144,6 +144,32 @@ All groups are logged by default. Turn groups off with `LogConfig(fields={"reque
 ```python
 df = rr.load_records("requests.db")   # pandas DataFrame if pandas is installed, else list of dicts
 ```
+
+## Caching
+
+With `cache=True`, a request that was already answered successfully is served from the logged records instead of being sent again. Re-running a script (e.g. after a crash) then only sends the requests that are still missing:
+
+```python
+client = rr.AsyncOpenAI(
+    log=rr.LogConfig(sqlite="requests.db"),
+    cache=True,                                  # or rr.CacheConfig(...)
+)
+```
+
+- **Key**: a hash of the URL and the complete JSON request body (model, messages and all parameters, after `default_params` are applied). Any change to the prompt or parameters is a miss.
+- **Source**: the records the client writes itself (`LogConfig.sqlite`, else `LogConfig.jsonl`; `response_body` must be logged), or another database or file via `rr.CacheConfig(sqlite=...)` / `rr.CacheConfig(jsonl=...)`.
+- **What is served**: only non-streamed requests whose record has status 200 and no error. Streamed requests are always sent.
+- **Hits** don't wait for or affect the throttle. They are logged with `cache_hit=True` (filter them out when analysing latency or token usage), and the response carries an `x-rr-cache: hit` header. `client.cache.stats()` counts hits and misses.
+- **Repeated sampling**: identical requests share one cached answer. To draw several independent samples, name the tags that belong to the key:
+
+```python
+client = rr.AsyncOpenAI(log=..., cache=rr.CacheConfig(key_tags=("sample",)))
+for i in range(5):
+    with rr.tags(sample=i):                      # 5 different keys; a re-run gets the same 5 answers
+        await client.chat.completions.create(model=m, messages=msgs, temperature=0.7)
+```
+
+Other tags (e.g. `experiment=...`) are not part of the key. Records are written asynchronously, so an identical request sent a few milliseconds after the first one may still go to the server.
 
 ## Caveats
 

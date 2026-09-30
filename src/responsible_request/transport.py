@@ -11,6 +11,7 @@ from typing import Any
 from loguru import logger
 
 from ._http import httpx
+from .cache import ResponseCache, cache_key
 from .config import LogConfig
 from .logging import emit_record
 from .records import (
@@ -43,6 +44,7 @@ class ThrottledTransport(httpx.AsyncBaseTransport):  # type: ignore[misc, name-d
         log: LogConfig | None = None,
         default_params: Mapping[str, Any] | None = None,
         inject_stream_usage: bool = True,
+        cache: ResponseCache | None = None,
         transport: Any = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -50,6 +52,7 @@ class ThrottledTransport(httpx.AsyncBaseTransport):  # type: ignore[misc, name-d
         self.log = log
         self.default_params = dict(default_params or {})
         self.inject_stream_usage = inject_stream_usage
+        self.cache = cache
         self._inner = transport if transport is not None else httpx.AsyncHTTPTransport()
         self._clock = clock
         self._last_summary = clock()
@@ -57,9 +60,7 @@ class ThrottledTransport(httpx.AsyncBaseTransport):  # type: ignore[misc, name-d
     async def handle_async_request(self, request: Any) -> Any:
         request, info = self._prepare(request)
         path = request.url.path
-        lane = self.throttle.lane(path, info.model)
-        eligible = not (info.uses_server_tools and self.throttle.config.ignore_server_tools)
-
+        tags = current_tags()
         record = RequestRecord(
             request_id=uuid.uuid4().hex,
             timestamp=utc_iso(time.time()),
@@ -68,10 +69,21 @@ class ThrottledTransport(httpx.AsyncBaseTransport):  # type: ignore[misc, name-d
             model=info.model,
             stream=info.stream,
             attempt=_int(request.headers.get("x-stainless-retry-count")) or 0,
-            tags=current_tags(),
+            tags=tags,
             params=info.params,
             request_body=info.body,
         )
+        if isinstance(info.body, dict):
+            salt = self.cache.salt(tags) if self.cache is not None else None
+            url = f"{request.method} {str(request.url).split('?')[0]}"
+            record.cache_key = cache_key(url, info.body, salt)
+            if self.cache is not None and not info.stream:
+                cached = self.cache.get(record.cache_key)
+                if cached is not None:
+                    return self._replay(record, cached)
+
+        lane = self.throttle.lane(path, info.model)
+        eligible = not (info.uses_server_tools and self.throttle.config.ignore_server_tools)
         queued = self._clock()
         await lane.limiter.acquire()
         sent = self._clock()
@@ -105,6 +117,8 @@ class ThrottledTransport(httpx.AsyncBaseTransport):  # type: ignore[misc, name-d
         )
 
     async def aclose(self) -> None:
+        if self.cache is not None:
+            self.cache.close()
         await self._inner.aclose()
 
     # ------------------------------------------------------------------ helpers
@@ -143,6 +157,15 @@ class ThrottledTransport(httpx.AsyncBaseTransport):  # type: ignore[misc, name-d
             extensions=request.extensions,
         )
         return new_request, info
+
+    def _replay(self, record: RequestRecord, body: dict[str, Any]) -> Any:
+        """Answer from the cache: no rate limiting, no load observation, but still a record."""
+        record.cache_hit = True
+        record.status_code = 200
+        apply_json_response(record, body)
+        record.response_body = body
+        emit_record(record.to_dict(self.log))
+        return httpx.Response(200, json=body, headers={"x-rr-cache": "hit"})
 
     def _first_byte(self, record: RequestRecord, sent: float) -> None:
         record.first_byte_at = utc_iso(time.time())

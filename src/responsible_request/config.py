@@ -158,3 +158,23 @@ class LogConfig:
 
     def with_fields(self, **toggles: bool) -> LogConfig:
         return replace(self, fields={**self.fields, **toggles})
+
+
+@dataclass(frozen=True)
+class CacheConfig:
+    """Answer requests from previously logged records instead of sending them again.
+
+    A request is served from the cache if a successful (HTTP 200) record with the same cache key
+    exists. The key is a hash of the URL and the complete JSON request body (model, messages and
+    all parameters, after ``default_params`` are applied), plus the values of ``key_tags``.
+    Streamed requests are never served from the cache. Cache hits are logged with
+    ``cache_hit=True`` and neither wait for nor affect the throttle.
+    """
+
+    sqlite: str | Path | None = None
+    """Read cached responses from this SQLite database (defaults to ``LogConfig.sqlite``)."""
+    jsonl: str | Path | None = None
+    """Read cached responses from this JSONL file (defaults to ``LogConfig.jsonl``)."""
+    key_tags: tuple[str, ...] = ()
+    """Tags (see :func:`responsible_request.tags`) that are part of the cache key, e.g.
+    ``("sample",)`` to draw several independent samples for the same request."""

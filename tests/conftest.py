@@ -59,7 +59,10 @@ def make_client(handler: Handler, **kwargs: Any) -> rr.AsyncOpenAI:
     throttle = kwargs.pop("throttle", rr.ThrottleConfig(max_rpm=6000, start_rpm=6000))
     log = kwargs.pop("log", False)
     default_params = kwargs.pop("default_params", None)
-    http = rr.http_client(throttle, log, default_params=default_params, transport=transport)
+    cache = kwargs.pop("cache", None)
+    http = rr.http_client(
+        throttle, log, default_params=default_params, cache=cache, transport=transport
+    )
     return rr.AsyncOpenAI(api_key="test", base_url="http://test/api/v1", http_client=http, **kwargs)
 
 

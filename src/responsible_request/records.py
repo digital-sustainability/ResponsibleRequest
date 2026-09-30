@@ -83,6 +83,8 @@ class RequestRecord:
     status_code: int | None = None
     error: str | None = None
     tags: dict[str, Any] = field(default_factory=dict)
+    cache_key: str | None = None  # hash of URL, JSON body and key tags (see CacheConfig)
+    cache_hit: bool = False  # served from the cache, not sent to the server
 
     # timing
     sent_at: str | None = None
