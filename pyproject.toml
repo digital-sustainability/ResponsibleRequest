@@ -1,0 +1,56 @@
+[project]
+name = "responsible-request"
+version = "0.1.0"
+description = "Load-aware adaptive rate limiting and request logging for OpenAI-compatible LLM gateways."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Luca Rolshoven" }]
+keywords = ["llm", "openai", "litellm", "rate-limiting", "throttling", "logging"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "aiolimiter>=1.2,<2",
+    "loguru>=0.7",
+    "openai>=1.40",
+    "pydantic>=2",
+]
+
+[project.optional-dependencies]
+pandas = ["pandas>=2"]
+progress = ["tqdm>=4"]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.10",
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+]
+
+[build-system]
+requires = ["uv_build>=0.8,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "responsible_request"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+ignore_missing_imports = true
