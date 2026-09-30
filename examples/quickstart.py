@@ -1,4 +1,4 @@
-"""Minimal usage against an OpenAI-compatible gateway.
+"""Minimal usage against an OpenAI-compatible endpoint.
 
     cp .env.example .env   # then fill in OPENAI_BASE_URL and OPENAI_API_KEY
     uv run --env-file .env python examples/quickstart.py gpt-oss:120b

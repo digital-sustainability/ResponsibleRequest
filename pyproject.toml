@@ -1,11 +1,11 @@
 [project]
 name = "responsible-request"
-version = "0.1.0"
-description = "Load-aware adaptive rate limiting and request logging for OpenAI-compatible LLM gateways."
+version = "0.2.0"
+description = "Polite, reproducible and cost-safe LLM requests for research: load-aware throttling, request logging, caching and budgets for OpenAI-compatible endpoints."
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "Luca Rolshoven" }]
-keywords = ["llm", "openai", "litellm", "rate-limiting", "throttling", "logging"]
+keywords = ["llm", "openai", "litellm", "openrouter", "rate-limiting", "throttling", "logging", "caching", "reproducibility"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Framework :: AsyncIO",

@@ -178,3 +178,63 @@ class CacheConfig:
     key_tags: tuple[str, ...] = ()
     """Tags (see :func:`responsible_request.tags`) that are part of the cache key, e.g.
     ``("sample",)`` to draw several independent samples for the same request."""
+
+
+@dataclass(frozen=True)
+class Price:
+    """Token prices in USD per million tokens (used when the response reports no cost)."""
+
+    input: float
+    output: float
+    cached_input: float | None = None
+    """Price of cached prompt tokens; defaults to ``input``."""
+
+    def cost(
+        self, prompt_tokens: int | None, completion_tokens: int | None, cached_tokens: int | None
+    ) -> float:
+        prompt, cached = prompt_tokens or 0, min(cached_tokens or 0, prompt_tokens or 0)
+        cached_price = self.input if self.cached_input is None else self.cached_input
+        total = (prompt - cached) * self.input + cached * cached_price
+        return (total + (completion_tokens or 0) * self.output) / 1_000_000
+
+
+@dataclass(frozen=True)
+class CostConfig:
+    """Track the cost of every request and optionally stop sending requests above a budget.
+
+    The cost of a request is the one reported by the provider (OpenRouter's ``usage.cost``, the
+    LiteLLM ``x-litellm-response-cost`` header, or a custom extractor), else it is computed from
+    ``prices`` and the token usage. Cache hits cost nothing.
+    """
+
+    budget_usd: float | None = None
+    """Refuse new requests (raising :class:`responsible_request.BudgetExceeded`) once this much
+    has been spent. Requests already in flight still complete, so the budget can be overshot by
+    their cost. Cache hits are always served."""
+    prices: Mapping[str, Price] = field(default_factory=dict)
+    """Fallback prices per model name, for providers that don't report a cost."""
+    include_logged: bool = True
+    """Count the cost already recorded in the request log (``LogConfig.sqlite``/``jsonl``), so
+    that restarting a script does not reset the budget."""
+
+    def __post_init__(self) -> None:
+        if self.budget_usd is not None and self.budget_usd < 0:
+            raise ValueError("budget_usd must be >= 0")
+
+
+@dataclass(frozen=True)
+class RunConfig:
+    """Describes a run: one client (or ``http_client``) from creation to close.
+
+    Every request record carries the ``run_id`` of its run. On the first request a run manifest
+    (versions, git commit, command line, all configurations, ``default_params``, ``metadata``) is
+    written to the ``runs`` table of the SQLite log, or to ``<name>.runs.jsonl`` next to the
+    JSONL log.
+    """
+
+    name: str | None = None
+    """Human-readable name of the run, e.g. the experiment."""
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+    """Anything else worth recording (dataset version, hyperparameters, notes, ...)."""
+    capture_git: bool = True
+    """Record the git commit and dirty flag of the working directory."""

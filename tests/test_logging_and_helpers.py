@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import pytest
-from loguru import logger
 from pydantic import BaseModel
 
 import responsible_request as rr
@@ -9,13 +8,6 @@ import responsible_request as rr
 from .conftest import body_of, chat_response, json_response, make_client
 
 MSG = [{"role": "user", "content": "hi"}]
-
-
-@pytest.fixture
-def cleanup_sinks():
-    yield
-    rr.remove_sinks()
-    logger.disable("responsible_request")
 
 
 async def test_jsonl_and_sqlite_sinks(tmp_path, cleanup_sinks):
