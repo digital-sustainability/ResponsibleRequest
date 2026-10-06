@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import sqlite3
 from pathlib import Path
-from typing import Any, Protocol
+from typing import IO, Any, Protocol
+
+from .logfiles import compression_of, open_binary, rotated_segments
 
 
 class _Target(Protocol):
@@ -70,55 +73,118 @@ class SQLiteSource:
             self._conn = None
 
 
-class JSONLSource:
-    """Indexes a JSONL record file by cache key and reads matching lines on demand.
+class _Rotated(Exception):
+    """The active file was replaced since it was last indexed."""
 
-    New lines (e.g. written by this process) are indexed incrementally on each lookup.
+
+class JSONLSource:
+    """Indexes a JSONL log by cache key and reads matching lines on demand.
+
+    The segments loguru rotated away from the log are indexed too. Responses from compressed
+    segments are kept in memory (only the first one per cache key); everything else is read back
+    by byte offset. New lines in the active file are indexed incrementally on each lookup, and a
+    rotation while the client runs triggers a full re-index.
     """
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
-        self._index: dict[str, int] = {}  # cache key -> byte offset of the first matching line
-        self._offset = 0  # bytes indexed so far
+        self._live = compression_of(self.path) is None  # a compressed file does not grow
+        self._reset()
+
+    def _reset(self) -> None:
+        # cache key -> (plain file, byte offset of the first matching line) or response JSON
+        self._index: dict[str, tuple[Path, int] | str] = {}
         self._cost = 0.0  # cost_usd of the indexed records that were not cache hits
+        self._loaded = False  # rotated or compressed segments indexed
+        self._file_id: tuple[int, int] | None = None  # (device, inode) of the active file
+        self._offset = 0  # bytes of the active file indexed so far
 
     def get(self, key: str) -> dict[str, Any] | None:
         if key not in self._index:
             self._scan()
-        pos = self._index.get(key)
-        if pos is None:
+        for _ in range(2):
+            entry = self._index.get(key)
+            if entry is None:
+                return None
+            body = self._read(key, entry)
+            if body is not None:
+                return body
+            # a rotation renamed, compressed or replaced the file since it was indexed
+            self._reset()
+            self._scan()
+        return None
+
+    @staticmethod
+    def _read(key: str, entry: tuple[Path, int] | str) -> dict[str, Any] | None:
+        if isinstance(entry, str):
+            body: dict[str, Any] = json.loads(entry)
+            return body
+        path, pos = entry
+        try:
+            with path.open("rb") as fh:
+                fh.seek(pos)
+                row = json.loads(fh.readline())
+        except (FileNotFoundError, ValueError):
             return None
-        with self.path.open("rb") as fh:
-            fh.seek(pos)
-            row = json.loads(fh.readline())
-        body: dict[str, Any] = row["response_body"]
+        if not isinstance(row, dict) or row.get("cache_key") != key:
+            return None
+        body = row["response_body"]
         return body
 
     def _scan(self) -> None:
+        for _ in range(5):
+            try:
+                if not self._loaded:
+                    self._load_segments()
+                if self._live:
+                    self._scan_active()
+                return
+            except (FileNotFoundError, _Rotated):  # loguru renamed or compressed a file under us
+                self._reset()
+
+    def _load_segments(self) -> None:
+        segments = rotated_segments(self.path) if self._live else [self.path]
+        for segment in segments:
+            with open_binary(segment) as fh:
+                self._index_lines(fh, segment, 0, in_memory=compression_of(segment) is not None)
+        self._loaded = True
+        if self._live:
+            self._scan_active()
+            if rotated_segments(self.path) != segments:  # rotated while we were reading
+                raise _Rotated
+
+    def _scan_active(self) -> None:
         try:
-            size = self.path.stat().st_size
-        except FileNotFoundError:
+            fh = self.path.open("rb")
+        except FileNotFoundError:  # nothing written yet, or in the middle of a rotation
             return
-        if size < self._offset:  # file was rotated or replaced
-            self._index.clear()
-            self._offset = 0
-            self._cost = 0.0
-        if size == self._offset:
-            return
-        with self.path.open("rb") as fh:
-            fh.seek(self._offset)
-            pos = self._offset
-            for line in fh:
-                if not line.endswith(b"\n"):  # still being written
-                    break
-                with contextlib.suppress(ValueError):
-                    row = json.loads(line)
-                    if isinstance(row, dict) and _cacheable(row):
-                        self._index.setdefault(row["cache_key"], pos)
-                    if isinstance(row, dict) and not row.get("cache_hit"):
-                        self._cost += float(row.get("cost_usd") or 0.0)
-                pos += len(line)
-        self._offset = pos
+        with fh:
+            stat = os.fstat(fh.fileno())
+            file_id = (stat.st_dev, stat.st_ino)
+            if self._file_id is None:
+                self._file_id = file_id
+            elif file_id != self._file_id or stat.st_size < self._offset:
+                raise _Rotated
+            if stat.st_size > self._offset:
+                fh.seek(self._offset)
+                self._offset = self._index_lines(fh, self.path, self._offset, in_memory=False)
+
+    def _index_lines(self, fh: IO[bytes], path: Path, pos: int, *, in_memory: bool) -> int:
+        for line in fh:
+            if not line.endswith(b"\n"):  # still being written
+                break
+            with contextlib.suppress(ValueError):
+                row = json.loads(line)
+                if not isinstance(row, dict):
+                    continue
+                if _cacheable(row) and row["cache_key"] not in self._index:
+                    self._index[row["cache_key"]] = (
+                        json.dumps(row["response_body"]) if in_memory else (path, pos)
+                    )
+                if not row.get("cache_hit"):
+                    self._cost += float(row.get("cost_usd") or 0.0)
+            pos += len(line)
+        return pos
 
     def total_cost(self) -> float:
         """Sum of ``cost_usd`` over all records that were not cache hits."""

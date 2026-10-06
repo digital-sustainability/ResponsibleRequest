@@ -19,6 +19,7 @@ from typing import Any
 from loguru import logger
 
 from .config import LogConfig
+from .logfiles import loguru_compression, strip_compression
 from .records import JSON_FIELDS, record_columns
 from .runs import RUN_COLUMNS, RUN_JSON_FIELDS
 
@@ -47,7 +48,7 @@ def _is_console_message(record: Any) -> bool:
 
 def runs_path(jsonl: str | Path) -> Path:
     """Where run manifests go for a JSONL log: ``requests.jsonl`` -> ``requests.runs.jsonl``."""
-    path = Path(jsonl)
+    path = strip_compression(Path(jsonl))
     return path.with_name(f"{path.stem}.runs{path.suffix or '.jsonl'}")
 
 
@@ -139,6 +140,7 @@ def setup_logging(config: LogConfig | None = None) -> None:
                     filter=_is_record,
                     format="{extra[rr_json]}",
                     rotation=config.rotation,
+                    compression=loguru_compression(config.compression),
                     enqueue=True,
                 )
             runs = runs_path(config.jsonl)
