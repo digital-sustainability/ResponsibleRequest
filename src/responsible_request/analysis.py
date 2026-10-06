@@ -7,6 +7,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from .logfiles import log_segments, open_binary, strip_compression
 from .logging import runs_path
 from .records import JSON_FIELDS
 from .runs import RUN_JSON_FIELDS
@@ -14,15 +15,22 @@ from .runs import RUN_JSON_FIELDS
 _JSONL_SUFFIXES = (".jsonl", ".json", ".log")
 
 
+def _is_jsonl(path: Path) -> bool:
+    return strip_compression(path).suffix in _JSONL_SUFFIXES
+
+
 def load_records(path: str | Path, *, as_dataframe: bool | None = None) -> Any:
     """Load request records from a JSONL file or SQLite database written by this package.
+
+    For a JSONL log, the segments rotated away from it are read too (oldest first, compressed or
+    not). A compressed file (e.g. ``requests.jsonl.zst``) is read on its own.
 
     Returns a pandas DataFrame if pandas is installed (or ``as_dataframe=True``), otherwise a
     list of dicts.
     """
     path = Path(path)
-    if path.suffix in _JSONL_SUFFIXES:
-        rows = _read_jsonl(path)
+    if _is_jsonl(path):
+        rows = [row for segment in log_segments(path) for row in _read_jsonl(segment)]
     else:
         rows = _read_table(path, "requests", JSON_FIELDS)
     return _output(rows, as_dataframe)
@@ -32,8 +40,8 @@ def load_runs(path: str | Path, *, as_dataframe: bool | None = None) -> Any:
     """Load run manifests (see :class:`responsible_request.RunConfig`) from the SQLite database,
     or for a JSONL log (``requests.jsonl``) from ``requests.runs.jsonl`` next to it."""
     path = Path(path)
-    if path.suffix in _JSONL_SUFFIXES:
-        runs = path if path.stem.endswith(".runs") else runs_path(path)
+    if _is_jsonl(path):
+        runs = path if strip_compression(path).stem.endswith(".runs") else runs_path(path)
         rows = _read_jsonl(runs) if runs.exists() else []
     else:
         rows = _read_table(path, "runs", RUN_JSON_FIELDS)
@@ -41,7 +49,7 @@ def load_runs(path: str | Path, *, as_dataframe: bool | None = None) -> Any:
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    with path.open(encoding="utf-8") as fh:
+    with open_binary(path) as fh:
         return [json.loads(line) for line in fh if line.strip()]
 
 

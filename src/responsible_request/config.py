@@ -7,6 +7,8 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from .logfiles import COMPRESSIONS, compression_of
+
 if TYPE_CHECKING:
     from .estimator import LoadEstimator
     from .records import RequestRecord
@@ -151,11 +153,20 @@ class LogConfig:
     console handlers are left untouched."""
     rotation: str | int | None = "500 MB"
     """Passed to loguru for the JSONL file."""
+    compression: str | None = None
+    """Compress JSONL segments once they are rotated away: ``"gz"``, ``"bz2"``, ``"xz"`` or
+    ``"zst"`` (zstd: Python 3.14+ or ``pip install responsible-request[zstd]``). Without
+    rotation, the file is compressed when its sink is removed. The cache, cost budget and
+    :func:`~responsible_request.load_records` read compressed segments too."""
 
     def __post_init__(self) -> None:
         unknown = set(self.fields) - set(FIELD_GROUPS)
         if unknown:
             raise ValueError(f"unknown field groups {sorted(unknown)}; valid: {FIELD_GROUPS}")
+        if self.compression is not None and self.compression not in COMPRESSIONS:
+            raise ValueError(f"unknown compression {self.compression!r}; valid: {COMPRESSIONS}")
+        if self.jsonl is not None and compression_of(Path(self.jsonl)):
+            raise ValueError("log to a plain .jsonl file and set compression= for its segments")
 
     def enabled(self, group: str) -> bool:
         return self.fields.get(group, True)

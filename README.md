@@ -182,6 +182,12 @@ All groups are logged by default. Turn groups off with `LogConfig(fields={"reque
 df = rr.load_records("requests.db")   # pandas DataFrame if pandas is installed, else list of dicts
 ```
 
+JSONL logs rotate at `rotation="500 MB"` (any loguru rotation). LLM logs are repetitive and compress well, so finished segments can be compressed with `compression="gz"`, `"bz2"`, `"xz"` or `"zst"` (zstd needs Python 3.14+ or `pip install responsible-request[zstd]`); the file being written stays plain. Without rotation, the file is compressed when the client's sinks are removed. `load_records("requests.jsonl")`, the cache and the cost budget read all segments, compressed or not, and `load_records` / `CacheConfig(jsonl=...)` also accept a single archive such as `requests.2026-10-06_12-00-00_000000.jsonl.zst`.
+
+```python
+log = rr.LogConfig(jsonl="requests.jsonl", rotation="100 MB", compression="zst")
+```
+
 ### Provider metadata
 
 Gateways and routers report different extra information. *Extractors* map it to the generic `response_meta` fields and put everything else into the `provider_meta` JSON column. All built-in extractors run on every response and only fill in what they find, so nothing has to be configured:
