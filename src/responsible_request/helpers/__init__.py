@@ -1,4 +1,5 @@
 from .batch import calibrate, run_batch, run_batch_sync
+from .messages import cached_system_message
 from .params import reproducible
 from .structured import (
     StructuredOutputError,
@@ -9,6 +10,7 @@ from .structured import (
 
 __all__ = [
     "StructuredOutputError",
+    "cached_system_message",
     "calibrate",
     "extract_json",
     "reproducible",

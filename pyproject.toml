@@ -1,6 +1,6 @@
 [project]
 name = "responsible-request"
-version = "0.2.0"
+version = "0.3.0"
 description = "Polite, reproducible and cost-safe LLM requests for research: load-aware throttling, request logging, caching and budgets for OpenAI-compatible endpoints."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -14,7 +14,6 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "aiolimiter>=1.2,<2",
     "loguru>=0.7",
     "openai>=1.40",
     "pydantic>=2",

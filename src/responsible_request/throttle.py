@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import random
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -48,6 +50,7 @@ class Lane:
         *,
         observed: bool,
         clock: Callable[[], float] = time.monotonic,
+        rng: random.Random | None = None,
     ) -> None:
         self.name = name
         self.config = config
@@ -62,6 +65,9 @@ class Lane:
         self.totals = LaneStats()
         self.since_summary = LaneStats()
         self.last_record: RequestRecord | None = None
+        self._rng = rng or random.Random()
+        self._backoff_level = 0  # consecutive 429s without Retry-After (fixed mode)
+        self._lock = threading.Lock()
 
     @property
     def rpm(self) -> float:
@@ -71,8 +77,40 @@ class Lane:
     def state(self) -> State:
         return self.controller.state
 
-    def observe(self, record: RequestRecord, *, eligible: bool) -> Transition | None:
-        """Update load estimate and rate after a request finished."""
+    def observe(
+        self, record: RequestRecord, *, eligible: bool, retry_after: float | None = None
+    ) -> Transition | None:
+        """Update load estimate and rate after a request finished.
+
+        ``retry_after`` is the server's ``Retry-After`` in seconds, if it sent one.
+        """
+        with self._lock:
+            if not self.config.adaptive:
+                self._handle_fixed(record, retry_after)
+            return self._observe(record, eligible=eligible)
+
+    def _handle_fixed(self, record: RequestRecord, retry_after: float | None) -> None:
+        """Fixed mode: pause this lane after a 429 instead of changing the rate."""
+        status = record.status_code
+        if status is not None and status < 400:
+            self._backoff_level = 0
+        if status != 429:
+            return
+        cfg = self.config
+        if retry_after is not None:
+            delay, reason = retry_after, "Retry-After"
+        else:
+            # 429s of requests sent before the current pause began do not raise the level.
+            if self.limiter.paused_s == 0 or self._backoff_level == 0:
+                self._backoff_level += 1
+            exponent = min(self._backoff_level - 1, 30)
+            delay = min(cfg.backoff_max_s, cfg.backoff_initial_s * 2**exponent)
+            reason = f"backoff #{self._backoff_level}"
+        delay += self._rng.uniform(0, cfg.backoff_jitter_s)
+        self.limiter.pause(delay)
+        logger.warning("{}: HTTP 429, pausing {:.1f} s ({})", self.name, delay, reason)
+
+    def _observe(self, record: RequestRecord, *, eligible: bool) -> Transition | None:
         self.last_record = record
         self.totals.add(record)
         self.since_summary.add(record)
@@ -90,12 +128,17 @@ class Lane:
         return transition
 
     def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return self._snapshot()
+
+    def _snapshot(self) -> dict[str, Any]:
         return {
             "state": self.state.value,
             "rpm": round(self.rpm, 2),
             "baseline": self.estimator.baseline,
             "load_ratio": self.estimator.load_ratio() if self.observed else None,
             "in_flight": self.limiter.in_flight,
+            "paused_s": round(self.limiter.paused_s, 2),
             "requests": self.totals.requests,
             "errors": self.totals.errors,
             "prompt_tokens": self.totals.prompt_tokens,
@@ -131,37 +174,48 @@ def _log_transition(name: str, t: Transition) -> None:
 
 
 class Throttle:
-    """All lanes of one client. Available as ``client.throttle`` on :class:`rr.AsyncOpenAI`."""
+    """All lanes of one client. Available as ``client.throttle`` on :class:`rr.AsyncOpenAI`.
+
+    To enforce one rate across several clients, e.g. one per thread with its own
+    ``asyncio.run``, create one ``Throttle`` and pass it as ``throttle=`` to each client.
+    """
 
     def __init__(
         self, config: ThrottleConfig | None = None, clock: Callable[[], float] = time.monotonic
     ) -> None:
         self.config = config or ThrottleConfig()
         self._clock = clock
+        self._rng = random.Random()  # seeded from OS entropy: jitter differs between clients
         self._lanes: dict[tuple[str, str | None], Lane] = {}
+        self._lock = threading.Lock()
 
     def lane(self, path: str, model: str | None) -> Lane:
         key = (path, model)
-        lane = self._lanes.get(key)
-        if lane is None:
-            observed = self.config.adaptive and any(
-                path.endswith(p) for p in self.config.observe_paths
-            )
-            name = model or path
-            lane = Lane(name, self.config, observed=observed, clock=self._clock)
-            self._lanes[key] = lane
-        return lane
+        with self._lock:
+            lane = self._lanes.get(key)
+            if lane is None:
+                observed = self.config.adaptive and any(
+                    path.endswith(p) for p in self.config.observe_paths
+                )
+                name = model or path
+                lane = Lane(name, self.config, observed=observed, clock=self._clock, rng=self._rng)
+                self._lanes[key] = lane
+            return lane
 
     def lanes(self) -> list[Lane]:
-        return list(self._lanes.values())
+        with self._lock:
+            return list(self._lanes.values())
 
     def find(self, model: str) -> list[Lane]:
-        return [lane for (_, m), lane in self._lanes.items() if m == model]
+        with self._lock:
+            return [lane for (_, m), lane in self._lanes.items() if m == model]
 
     def stats(self) -> dict[str, dict[str, Any]]:
         """Current state, rate, load and totals per lane (keyed by model, or path)."""
+        with self._lock:
+            items = list(self._lanes.items())
         out: dict[str, dict[str, Any]] = {}
-        for (path, model), lane in self._lanes.items():
+        for (path, model), lane in items:
             key = model if model is not None else path
             if key in out:
                 key = f"{model} {path}"
@@ -170,6 +224,6 @@ class Throttle:
 
     def reset_baseline(self, model: str | None = None) -> None:
         """Forget learned baselines (of one model, or all)."""
-        for lane in self._lanes.values():
+        for lane in self.lanes():
             if model is None or lane.name == model:
                 lane.estimator.reset()

@@ -68,7 +68,15 @@ class ThrottleConfig:
     """Exclude requests using server-side tools (e.g. MCP, web search) from the load estimate,
     since their latency includes external calls."""
     adaptive: bool = True
-    """If False, requests are paced at a constant ``max_rpm``."""
+    """If False, requests are paced at a constant ``max_rpm``; a 429 then pauses the lane (see
+    ``backoff_initial_s``) instead of lowering the rate."""
+    backoff_initial_s: float = 1.0
+    """Fixed mode: pause after a 429 without a usable ``Retry-After`` header; doubles with every
+    further 429 until a request succeeds."""
+    backoff_max_s: float = 60.0
+    """Fixed mode: upper bound of that backoff (an explicit ``Retry-After`` is obeyed as is)."""
+    backoff_jitter_s: float = 1.0
+    """Fixed mode: random extra time in ``[0, backoff_jitter_s]`` added to every pause."""
     estimator_factory: Callable[[ThrottleConfig], LoadEstimator] | None = None
     """Custom load estimator (see :class:`responsible_request.estimator.LoadEstimator`)."""
 
@@ -83,6 +91,8 @@ class ThrottleConfig:
             raise ValueError("max_concurrency and window must be >= 1")
         if not 0 < self.baseline_percentile < 100:
             raise ValueError("baseline_percentile must be in (0, 100)")
+        if not 0 <= self.backoff_initial_s <= self.backoff_max_s or self.backoff_jitter_s < 0:
+            raise ValueError("require 0 <= backoff_initial_s <= backoff_max_s and jitter >= 0")
 
     @property
     def initial_rpm(self) -> float:
@@ -91,14 +101,19 @@ class ThrottleConfig:
         return min(self.max_rpm, max(self.min_rpm, self.start_rpm))
 
     @classmethod
-    def fixed(cls, rpm: float, max_concurrency: int = 32) -> ThrottleConfig:
-        """A plain rate limiter at a constant ``rpm`` (no load adaptation)."""
+    def fixed(cls, rpm: float, max_concurrency: int = 32, **kwargs: Any) -> ThrottleConfig:
+        """A plain rate limiter at a constant ``rpm`` (no load adaptation).
+
+        A 429 pauses the affected model for ``Retry-After`` (or an exponential backoff) plus
+        jitter. Further keyword arguments (e.g. ``backoff_max_s``) are passed to the constructor.
+        """
         return cls(
             max_rpm=rpm,
             min_rpm=rpm,
             start_rpm=rpm,
             max_concurrency=max_concurrency,
             adaptive=False,
+            **kwargs,
         )
 
 

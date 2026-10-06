@@ -14,7 +14,7 @@ Large experiments can starve the other users of a shared inference server. Hard 
 - As soon as latency reaches 3× the baseline (or the server returns 429/5xx/timeouts), other users are active, so the client drops to `min_rpm` at once.
 - Once latency is back to normal, the client ramps up again.
 
-For commercial APIs with generous rate limits of their own (OpenAI, OpenRouter, …), load-aware throttling is not needed: use a plain fixed-rate limiter, `rr.ThrottleConfig.fixed(rpm)`. The adaptive throttle treats a 429 as a sign of other users and drops to `min_rpm` for at least `cooldown_s`.
+For commercial APIs with generous rate limits of their own (OpenAI, OpenRouter, …), load-aware throttling is not needed: use a plain fixed-rate limiter, `rr.ThrottleConfig.fixed(rpm)`. In fixed mode a 429 does not change the rate: it pauses only the affected model (and endpoint) for the time in the `Retry-After` header, or for an exponential backoff (`backoff_initial_s`, doubling up to `backoff_max_s`) if there is none, plus a random jitter of up to `backoff_jitter_s`. The adaptive throttle instead treats a 429 as a sign of other users and drops to `min_rpm` for at least `cooldown_s`.
 
 ## Installation
 
@@ -86,7 +86,11 @@ class Answer(BaseModel):
     confidence: float
 
 answer = await rr.structured(client, model=m, messages=msgs, schema=Answer, retries=2)
+# (if `content` is empty, the answer is read from `reasoning`, then `reasoning_content`)
 rr.response_format_from_model(Answer)                 # just the strict json_schema response_format
+
+# System prompt marked for OpenRouter's prompt cache (cache_control: ephemeral)
+messages = [rr.cached_system_message(long_instructions), {"role": "user", "content": question}]
 
 # Attach metadata to every request record created inside the block
 with rr.tags(experiment="ablation-3", fold=2):
@@ -95,6 +99,8 @@ with rr.tags(experiment="ablation-3", fold=2):
 # Measure and pin the baseline explicitly, e.g. at night with a representative request
 await rr.calibrate(client, "gpt-oss:120b", n=10, messages=representative_messages)
 ```
+
+`rr.cached_system_message()` only asks the provider to cache the prompt prefix (cheaper input tokens, the model still runs), whereas `cache=True` replays complete stored responses from your SQLite or JSONL log without sending the request.
 
 ## How the throttle works
 
@@ -107,7 +113,13 @@ start_rpm                  ramp ×1.5 / 30 s        ramp ×1.5 / 30 s   cooldown
                            up to max_rpm                              ratio < recover_ratio (1.5)
 ```
 
-- **Pacing**: requests are spaced evenly at the current rate with no bursts ([aiolimiter](https://github.com/mjpieters/aiolimiter)), and `max_concurrency` caps the number in flight.
+- **Pacing**: requests are spaced evenly at the current rate with no bursts, and `max_concurrency` caps the number in flight. One `Throttle` can be shared by several clients, also across threads that each run their own event loop (e.g. `asyncio.run` per thread), and then enforces one rate for all of them:
+
+  ```python
+  throttle = rr.Throttle(rr.ThrottleConfig.fixed(60))
+  def worker(items):  # runs in its own thread
+      asyncio.run(work(rr.AsyncOpenAI(throttle=throttle, ...), items))
+  ```
 - **Per model**: every (endpoint, model) pair has its own lane, because load on one backend says nothing about another. Only `/chat/completions` and `/embeddings` feed the latency estimate (`observe_paths`). Other endpoints (audio, …) are paced and react to errors only. Requests with server-side tools (MCP, web search) are ignored for load estimation, because their latency includes external calls.
 - **Signal**: by default, latency per completion token (`latency / max(completion_tokens, 16)`), so long answers and reasoning traces don't look like load. For streamed requests the signal is the time to first byte. The current value is the median of the last `window` requests.
 - **Baseline**: the 10th percentile of the signal over the last 30 minutes, needing `warmup_requests` samples first. Samples taken while throttled are excluded, so a long busy period does not become the new "normal". You can pin it with `ThrottleConfig(baseline=...)` or `rr.calibrate(...)`, and reset it with `client.throttle.reset_baseline()`.
@@ -144,6 +156,8 @@ start_rpm                  ramp ×1.5 / 30 s        ramp ×1.5 / 30 s   cooldown
 | `baseline_percentile` / `baseline_window_s` | 10 / 1800 | baseline estimator |
 | `observe_paths` | chat, embeddings | endpoints whose latency is used |
 | `estimator_factory` | None | plug in your own `LoadEstimator` (e.g. reading queue depth from Prometheus) |
+| `backoff_initial_s` / `backoff_max_s` | 1 / 60 | fixed mode: pause after a 429 without `Retry-After`, doubling per further 429 |
+| `backoff_jitter_s` | 1 | fixed mode: random extra time added to every 429 pause |
 
 ## Logging
 
