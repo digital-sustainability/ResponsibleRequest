@@ -65,6 +65,16 @@ def extract_json(text: str) -> str:
     return text
 
 
+def _answer_text(message: Any) -> str:
+    """The answer text: ``content``, else ``reasoning``, else ``reasoning_content`` (some
+    reasoning models put the JSON there and leave ``content`` empty)."""
+    for key in ("content", "reasoning", "reasoning_content"):
+        value = getattr(message, key, None)  # the SDK's models keep unknown fields as attributes
+        if isinstance(value, str) and value.strip():
+            return value
+    return ""
+
+
 async def structured(
     client: openai.AsyncOpenAI,
     *,
@@ -81,6 +91,8 @@ async def structured(
     If the answer does not validate, the model is shown the validation error and asked again
     (up to ``retries`` times). If the backend rejects ``json_schema`` response formats and
     ``fallback`` is set, it switches to ``json_object`` mode with the schema in the prompt.
+    If the message ``content`` is empty, the answer is read from ``reasoning``, then from
+    ``reasoning_content`` (some reasoning models put the JSON there).
 
     Extra keyword arguments are passed to ``client.chat.completions.create``.
     """
@@ -115,7 +127,7 @@ async def structured(
             response_format = {"type": "json_object"}
             continue  # the fallback does not count as a retry
 
-        content = response.choices[0].message.content or ""
+        content = _answer_text(response.choices[0].message)
         try:
             return schema.model_validate_json(extract_json(content))
         except ValidationError as exc:

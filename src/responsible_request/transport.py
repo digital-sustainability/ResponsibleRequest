@@ -6,6 +6,7 @@ import json
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 from loguru import logger
@@ -213,15 +214,18 @@ class ThrottledTransport(httpx.AsyncBaseTransport):  # type: ignore[misc, name-d
         record.finished_at = utc_iso(time.time())
         if error is not None and record.error is None:
             record.error = f"{type(error).__name__}: {error}"
+        retry_after = None
         if response is not None:
             headers, raw = response
             body = _apply_body(record, headers, raw) if raw is not None else None
             self._extract(record, headers, body)
+            if record.status_code == 429:
+                retry_after = retry_after_seconds(headers)
         if self.cost is not None:
             self.cost.add(record)
 
         ok_status = record.status_code is not None and record.status_code < 400
-        lane.observe(record, eligible=eligible and ok_status)
+        lane.observe(record, eligible=eligible and ok_status, retry_after=retry_after)
         record.state = lane.state.value
         record.baseline = lane.estimator.baseline
         record.load_ratio = lane.estimator.load_ratio() if lane.observed else None
@@ -255,6 +259,27 @@ class ThrottledTransport(httpx.AsyncBaseTransport):  # type: ignore[misc, name-d
                 f", load {ratio:.2f}x" if ratio is not None else "",
             )
             lane.since_summary = type(s)()
+
+
+def retry_after_seconds(headers: Any) -> float | None:
+    """Wait time requested by ``retry-after-ms`` or ``retry-after`` (seconds or HTTP date)."""
+    value = headers.get("retry-after-ms")
+    if value is not None:
+        try:
+            return max(0.0, float(value) / 1000)
+        except ValueError:
+            pass
+    value = headers.get("retry-after")
+    if value is None:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        return max(0.0, parsedate_to_datetime(value).timestamp() - time.time())
+    except (TypeError, ValueError, IndexError):
+        return None
 
 
 def _int(value: str | None) -> int | None:

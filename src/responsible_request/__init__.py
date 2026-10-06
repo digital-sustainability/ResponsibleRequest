@@ -32,6 +32,7 @@ from .cost import BudgetExceeded, CostTracker
 from .estimator import LatencyEstimator, LoadEstimator
 from .helpers import (
     StructuredOutputError,
+    cached_system_message,
     calibrate,
     extract_json,
     reproducible,
@@ -74,6 +75,7 @@ __all__ = [
     "ThrottleController",
     "ThrottledTransport",
     "__version__",
+    "cached_system_message",
     "calibrate",
     "extract_json",
     "get_throttle",

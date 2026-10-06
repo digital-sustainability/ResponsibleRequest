@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
+import time
 from typing import Any
 
 import openai
@@ -8,6 +11,7 @@ import pytest
 
 import responsible_request as rr
 from responsible_request._http import httpx
+from responsible_request.records import RequestRecord
 
 from .conftest import body_of, chat_response, json_response, make_client
 
@@ -176,3 +180,108 @@ async def test_rr_client_copy_keeps_throttle():
     client = make_client(lambda req: json_response(chat_response()))
     copy = client.with_options(max_retries=0)
     assert copy.throttle is client.throttle
+
+
+def test_one_throttle_shared_by_clients_in_threads():
+    throttle = rr.Throttle(rr.ThrottleConfig.fixed(60000, max_concurrency=4))
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        async def main() -> None:
+            client = make_client(lambda req: json_response(chat_response()), throttle=throttle)
+            await asyncio.gather(
+                *(client.chat.completions.create(model="m", messages=MSG) for _ in range(10))
+            )
+            await client.close()
+
+        try:
+            asyncio.run(main())
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    assert not any(t.is_alive() for t in threads) and not errors
+    assert throttle.stats()["m"]["requests"] == 60
+
+
+def _rate_limited(seconds: str | None = None) -> Any:
+    headers = {} if seconds is None else {"retry-after": seconds}
+    return json_response({"error": {"message": "slow down"}}, 429, **headers)
+
+
+async def test_fixed_mode_obeys_retry_after(records):
+    responses = iter([_rate_limited("0.3"), json_response(chat_response())])
+    config = rr.ThrottleConfig.fixed(60000, backoff_jitter_s=0.05)
+    client = make_client(lambda req: next(responses), throttle=config, max_retries=0)
+    with pytest.raises(openai.RateLimitError):
+        await client.chat.completions.create(model="m", messages=MSG)
+    await client.chat.completions.create(model="m", messages=MSG)
+    assert [r["status_code"] for r in records] == [429, 200]
+    assert 0.29 <= records[1]["wait_s"] < 0.6
+    assert records[0]["state"] == "fixed" and client.throttle.stats()["m"]["rpm"] == 60000
+
+
+async def test_fixed_mode_pauses_only_the_affected_model(records):
+    def handler(req):
+        if body_of(req)["model"] == "a":
+            return _rate_limited("30")
+        return json_response(chat_response())
+
+    client = make_client(handler, throttle=rr.ThrottleConfig.fixed(60000), max_retries=0)
+    with pytest.raises(openai.RateLimitError):
+        await client.chat.completions.create(model="a", messages=MSG)
+    await client.chat.completions.create(model="b", messages=MSG)
+    assert records[1]["wait_s"] < 0.1
+    stats = client.throttle.stats()
+    assert stats["a"]["paused_s"] > 29 and stats["b"]["paused_s"] == 0
+
+
+def test_fixed_mode_backoff_without_retry_after():
+    config = rr.ThrottleConfig.fixed(
+        60000, backoff_initial_s=0.05, backoff_max_s=0.15, backoff_jitter_s=0
+    )
+    lane = rr.Throttle(config).lane("/v1/chat/completions", "m")
+
+    def observe(status: int) -> float:
+        lane.observe(RequestRecord("id", "t", "POST", "/", status_code=status), eligible=True)
+        return lane.limiter.paused_s
+
+    pauses = []
+    for _ in range(4):
+        pauses.append(observe(429))
+        time.sleep(pauses[-1] + 0.01)  # the next request is sent after the pause
+    assert pauses == pytest.approx([0.05, 0.1, 0.15, 0.15], abs=0.01)
+    observe(429)  # a 429 of a request sent during the pause does not raise the level
+    assert lane.limiter.paused_s == pytest.approx(0.15, abs=0.01)
+    time.sleep(0.16)
+    observe(200)
+    assert observe(429) == pytest.approx(0.05, abs=0.01)  # success resets the backoff
+
+
+def test_fixed_mode_jitter_differs_between_throttles():
+    config = rr.ThrottleConfig.fixed(60000, backoff_jitter_s=10)
+    pauses = set()
+    for _ in range(2):
+        lane = rr.Throttle(config).lane("/v1/chat/completions", "m")
+        record = RequestRecord("id", "t", "POST", "/", status_code=429)
+        lane.observe(record, eligible=True, retry_after=0)
+        pauses.add(round(lane.limiter.paused_s, 3))
+    assert len(pauses) == 2
+
+
+def test_retry_after_parsing():
+    from email.utils import formatdate
+
+    from responsible_request.transport import retry_after_seconds
+
+    assert retry_after_seconds(httpx.Headers({"retry-after-ms": "1500"})) == 1.5
+    assert retry_after_seconds(httpx.Headers({"retry-after": "2"})) == 2.0
+    assert retry_after_seconds(httpx.Headers({"retry-after": "-3"})) == 0.0
+    date = formatdate(time.time() + 20, usegmt=True)
+    assert 18 < retry_after_seconds(httpx.Headers({"retry-after": date})) <= 20  # type: ignore[operator]
+    assert retry_after_seconds(httpx.Headers({"retry-after": "soon"})) is None
+    assert retry_after_seconds(httpx.Headers()) is None

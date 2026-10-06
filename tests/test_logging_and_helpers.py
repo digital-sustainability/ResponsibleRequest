@@ -132,3 +132,45 @@ async def test_adaptive_throttling_end_to_end(clock):
     await send(10)
     stats = client.throttle.stats()["m"]
     assert stats["state"] in ("recovering", "normal") and stats["rpm"] > 6000
+
+
+def _reasoning_response(**fields: str | None) -> dict:
+    response = chat_response()
+    response["choices"][0]["message"] = {"role": "assistant", "content": None, **fields}
+    return response
+
+
+BERN = '{"city": "Bern", "confidence": 0.9}'
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"reasoning": BERN},
+        {"content": "", "reasoning": "", "reasoning_content": BERN},
+        {"content": BERN, "reasoning": '{"city": "Zug"}'},
+    ],
+)
+async def test_structured_reads_reasoning_when_content_is_empty(fields):
+    client = make_client(lambda req: json_response(_reasoning_response(**fields)))
+    result = await rr.structured(client, model="m", messages=MSG, schema=Answer, retries=0)
+    assert result == Answer(city="Bern", confidence=0.9)
+
+
+async def test_cached_system_message():
+    message = rr.cached_system_message("You are terse.")
+    assert message == {
+        "role": "system",
+        "content": [
+            {"type": "text", "text": "You are terse.", "cache_control": {"type": "ephemeral"}}
+        ],
+    }
+    seen = []
+
+    def handler(req):
+        seen.append(body_of(req))
+        return json_response(chat_response())
+
+    client = make_client(handler)
+    await client.chat.completions.create(model="m", messages=[message, *MSG])
+    assert seen[0]["messages"][0] == message
